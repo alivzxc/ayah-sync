@@ -1,19 +1,41 @@
 {
   "name": "ayah-sync",
   "version": "0.1.1",
-  "description": "Follows Quran recitation videos word by word and shows the translation. Needs the Ayah Sync helper running on your computer.",
+  "description": "Follows Quran recitation videos with translations using browser CPU recognition or the local GPU helper.",
   "type": "module",
   "scripts": {
     "fetch-data": "node scripts/fetch-quran-data.mjs",
     "fetch-fonts": "node scripts/fetch-fonts.mjs",
     "fetch-translations": "node scripts/fetch-translations.mjs",
     "dev": "vite",
-    "build": "vite build",
+    "prepare-browser-runtime": "node scripts/prepare-browser-runtime.mjs",
+    "test:local": "node scripts/test-local-matcher.mjs && node scripts/test-lookahead-session.mjs",
+    "test:capture": "node scripts/test-local-capture.mjs",
+    "test:threads": "node scripts/test-cpu-threads.mjs",
+    "test:lookahead": "node scripts/test-cpu-lookahead.mjs",
+    "test:lookahead:session": "node scripts/test-lookahead-session.mjs",
+    "test:short-ayah-ui": "node scripts/test-short-ayah-ui.mjs",
+    "test:short-ayah-audio": "node scripts/test-cpu-short-audio.mjs",
+    "test:ayah-onsets": "node scripts/test-cpu-ayah-onsets.mjs",
+    "test:audio-batches": "node scripts/test-audio-batches.mjs && node scripts/test-audio-batch-decoding.mjs",
+    "test:direct-media": "node scripts/test-direct-media-policy.mjs && node scripts/test-direct-media-browser.mjs",
+    "test:youtube": "node scripts/test-youtube-policy.mjs && node scripts/test-youtube-routing.mjs && node scripts/test-youtube-browser.mjs",
+    "test:youtube:online": "node scripts/test-youtube-online.mjs",
+    "test:youtube:batches:online": "node scripts/test-youtube-batches-online.mjs",
+    "test:popup": "node scripts/test-cpu-activity.mjs && node scripts/test-popup-cpu-activity.mjs",
+    "build": "npm run prepare-browser-runtime && vite build",
     "preview": "vite preview"
   },
   "devDependencies": {
     "@crxjs/vite-plugin": "^2.0.0-beta.28",
     "puppeteer-core": "^25.13.0",
     "vite": "^5.4.10"
+  },
+  "dependencies": {
+    "bgutils-js": "4.0.3",
+    "googlevideo": "5.0.1",
+    "mediabunny": "1.62.1",
+    "onnxruntime-web": "1.31.0-dev.20260914-8d85527a0",
+    "youtubei.js": "18.3.0"
   }
 }

@@ -20,6 +20,26 @@ step.
 hand and run a small helper program on your own computer. See
 [Known limits](#known-limits).
 
+### Quick start on CPU
+
+1. Load the extension in Chrome and open a recitation video.
+2. Select **Recognition → Browser CPU**, then **Start CPU sync**.
+3. Keep **Auto CPU look-ahead** enabled. YouTube videos first try browser audio
+   downloading with **YouTube.js** (no Python/yt-dlp needed on success). This is
+   experimental: YouTube playback attestation can block downloads. For an
+   optional download fallback, install Python and FFmpeg, then run:
+   ```bash
+   python -m pip install -r server/requirements-audio.txt
+   python server/audio_server.py
+   ```
+   CPU downloads support videos up to **10 hours**: first 3 minutes around your
+   starting position, then up to 30-minute batches in the background. Sync waits
+   for 12 seconds of recognized look-ahead before displaying ayahs.
+   If downloading is unavailable, CPU mode falls back to live listening.
+
+No NVIDIA GPU is required. See [Browser CPU option](#browser-cpu-option-experimental)
+for details.
+
 ## What you need
 
 - Windows 10/11 (macOS and Linux should work but are untested)
@@ -87,11 +107,17 @@ rather than timing it exactly.
 
 - Everything runs on your computer. There is no server of ours, no account, no
   ads and no tracking.
-- The extension does not record keystrokes, read your browsing history, or read
-  the content of pages. On each page it only looks for a video player and the
-  page's background colour.
-- When you sync, the video's address is passed to the helper on your own
-  machine, which downloads the audio into `server/cache`.
+- The extension does not record keystrokes or read your browsing history. On a
+  page it looks for a video player and the page's background colour.
+- CPU YouTube look-ahead contacts YouTube/Google Video directly through a
+  restricted extension fetch bridge. YouTube.js fetches session/player metadata;
+  playback attestation may execute Google's challenge code in an isolated
+  sandbox with no extension APIs, parent DOM access, or direct network access.
+  Browser-managed cookies may accompany allowed requests, but the extension
+  does not request cookie-reading permission. Audio, session data and tokens
+  are not persisted by this integration or uploaded to our servers.
+- GPU sync and the optional CPU helper fallback pass the video's address to the
+  helper on your own machine, which downloads audio into `server/cache`.
 - Chrome's install prompt says the extension can "read and change all your data
   on all websites". That permission is what lets the card appear on any site;
   the code is here for you to check what it actually does.
@@ -135,8 +161,87 @@ Load `dist/` as an unpacked extension. The helper lives in `server/`; see
 [server/README.md](server/README.md). `harness/` runs the built extension in an
 ordinary browser tab for testing.
 
+### Browser CPU option (experimental)
+
+Select **Recognition → Browser CPU**, then **Start CPU sync**. The bundled int8
+[Abdou/quran-asr-small on Hugging Face](https://huggingface.co/Abdou/quran-asr-small)
+model runs locally in the browser—no NVIDIA GPU or audio upload required.
+
+- **YouTube.js browser look-ahead:** uses the [`youtubei.js/web` browser entry
+  point and custom fetch interface](https://ytjs.dev/guide/browser-usage.html),
+  `googlevideo` for audio-only SABR, and `bgutils-js` for attestation. No custom
+  signature, manifest or UMP parser is used. The libraries' player/challenge
+  evaluation is confined to an opaque-origin sandbox; privileged extension
+  pages retain their strict script policy. Successful downloads are decoded
+  locally to 16 kHz mono and reused by the existing CPU recognizer. It fetches
+  **3 minutes at the starting playhead** (including 10 seconds of pre-roll),
+  then downloads the rest in **up to 30-minute background batches**. Uncached
+  seeks take priority with another small three-minute fetch. Mediabunny reads
+  partial MP4/WebM containers; only 20-second PCM windows are decoded, rather
+  than holding hours of audio in RAM. Compressed batches use a private temporary
+  disk cache (512 MiB LRU, or a 64 MiB memory LRU if disk access is denied).
+  Browser downloads support **prerecorded YouTube videos up to 10 hours,
+  64 MiB compressed per batch, and two audio channels**. DRM, live and post-live DVR
+  are not supported by this path. Coverage is not guaranteed: an ordinary
+  playable video can still fail attestation or downloading in this session.
+- **Audio helper fallback:** uses an available helper to download 3 minutes around
+  the current playback position (including 10 seconds of recognition context),
+  then downloads subsequent audio in 30-minute batches in the background, up to
+  10-hour videos. Seeking
+  fetches the needed batch on demand. CPU recognition stays 12 seconds ahead;
+  GPU downloads are unchanged. It waits for the initial buffer before displaying
+  ayahs and follows playback through pauses and seeks. Helper setup is in
+  [Quick start on CPU](#quick-start-on-cpu); only one helper can use port 8790.
+- **CPU replay and timeline:** recognized verses and word timings stay in memory
+  for the current sync session, so seeking back reuses them without recognizing
+  the same section again. The card's timeline shows processed sections at their
+  positions across the full video, leaving unprocessed gaps blank. Stop/restart
+  sync clears this recognition cache; it is separate from downloaded audio.
+- **Live-only:** works without Python. Disable Auto CPU look-ahead to force it;
+  it is also the fallback when browser/helper downloading is unavailable. An
+  optional audible capture stream is held during YouTube download preparation
+  so fallback can work after closing the popup, then released on success. If
+  Chrome did not grant capture, reopen the popup and start live-only instead.
+- **Other sites and GPU:** non-YouTube sites keep the existing helper/live paths;
+  GPU download and alignment behavior is unchanged.
+- **Word highlighting:** defaults on with look-ahead, off otherwise; saved
+  preferences take priority. Timing is best-effort, not guaranteed exact.
+- **CPU ayah switches:** look-ahead uses the confirmed first word's speech onset
+  with a small lead, rather than waiting for a later recognition token. Earlier
+  first-word evidence is reused after the ayah is confirmed. Live-only mode still
+  has recognition latency because it cannot hear future audio.
+- **Next video:** click **Sync this video** on the card to restart CPU sync.
+
+CPU mode uses up to four WASM threads with a single-thread fallback. Performance
+varies by device; GPU recognition and full-video alignment remain separate.
+
+For source builds, download the CPU model before building:
+
+```bash
+python scripts/export-browser-model.py
+npm run build
+```
+
+Tests: `npm run test:local`, `npm run test:capture`, `npm run test:threads`, and
+`npm run test:lookahead` (requires Python/FFmpeg and a free port 8790).
+`npm run test:youtube` checks the packaged sandbox, real YouTube.js browser fetch
+bridge, decoding, network restrictions, cancellation and failed-download cleanup
+without relying on YouTube network availability. `npm run test:audio-batches`
+checks ten-hour scheduling, seek priority, boundary stitching, partial MP4/WebM
+decoding and bounded disk caching (requires FFmpeg). The opt-in
+`npm run test:youtube:batches:online` checks actual long-video range downloads.
+See
+[YouTube.js integration notes](docs/youtube-browser.md) for limitations.
+
 ## Credits
 
+- Browser speech model: [Abdou/quran-asr-small](https://huggingface.co/Abdou/quran-asr-small)
+  (MIT), an int8 Zipformer CTC model run locally through ONNX Runtime Web.
+- Browser YouTube downloading: [YouTube.js](https://github.com/LuanRT/YouTube.js),
+  [googlevideo](https://github.com/LuanRT/googlevideo), and
+  [BgUtils](https://github.com/LuanRT/BgUtils) (MIT).
+- Browser partial-container reading/decoding: [Mediabunny](https://github.com/Vanilagy/mediabunny)
+  1.62.1 (MPL-2.0; unmodified library source available at the linked project).
 - Quran text and translations: [Al-Quran Cloud](https://alquran.cloud) and
   [quran.com](https://quran.com). Translators: Saheeh International (English),
   Fateh Muhammad Jalandhry (Urdu), Indonesian Ministry of Religious Affairs,

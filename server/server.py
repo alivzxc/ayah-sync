@@ -24,6 +24,8 @@ import websockets
 
 import engine
 import align
+import audio_source
+import helper_health
 
 SR = 16000
 WINDOW_SEC = 6.0          # rolling window analysed each pass (live mode)
@@ -99,7 +101,9 @@ async def handle(ws):
     buf = np.zeros(0, dtype=np.float32)
     win = int(WINDOW_SEC * SR)
     stop = False
-    await ws.send(json.dumps({"type": "ready", "model": engine.MODEL_ID, "device": engine.device}))
+    cpu_source = None
+    await ws.send(json.dumps({"type": "ready", "model": engine.MODEL_ID, "device": engine.device,
+                              "capabilities": {"cpu_audio": True, "align": True, "live": True}}))
 
     async def live_loop():
         nonlocal buf
@@ -171,6 +175,14 @@ async def handle(ws):
                     jobs.append(asyncio.create_task(handle_align(ws, data)))
                 elif data.get("type") == "ping":
                     await ws.send(json.dumps({"type": "pong"}))
+                elif data.get("type") in ("cpu_audio_prepare", "cpu_audio_window"):
+                    try:
+                        if data["type"] == "cpu_audio_prepare":
+                            cpu_source = await audio_source.prepare_message(ws, data)
+                        else:
+                            await audio_source.window_message(ws, cpu_source, data)
+                    except Exception as error:
+                        await ws.send(json.dumps({"type": "cpu_audio_error", "error": str(error)[-300:]}))
     except websockets.ConnectionClosed:
         pass
     finally:
@@ -181,7 +193,7 @@ async def handle(ws):
 
 async def main():
     print(f"Listening on ws://{HOST}:{PORT}")
-    async with websockets.serve(handle, HOST, PORT, max_size=None):
+    async with websockets.serve(handle, HOST, PORT, max_size=None, process_request=helper_health.process_request):
         await asyncio.Future()  # run forever
 
 

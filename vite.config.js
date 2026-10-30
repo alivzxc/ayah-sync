@@ -4,10 +4,12 @@ import manifest from './manifest.config.js';
 
 export default defineConfig({
   plugins: [crx({ manifest })],
+  worker: { format: 'es' },
   build: {
     rollupOptions: {
       input: {
         offscreen: 'src/offscreen/offscreen.html',
+        youtubeSandbox: 'src/cpu/youtube-sandbox.html',
       },
     },
   },

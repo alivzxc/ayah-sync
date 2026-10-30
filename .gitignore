@@ -13,3 +13,7 @@ __pycache__/
 .claude/
 .DS_Store
 *.log
+
+# Generated browser model/runtime (recreated by export + prepare scripts)
+public/models/
+public/ort/

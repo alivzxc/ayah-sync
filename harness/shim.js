@@ -4,6 +4,8 @@
  *
  *   popup:  ?view=idle|working|ready|live|helper|error
  *   card:   ?tl=<timeline json in /cache>&media=<audio in /cache>
+ *   CPU UI: ?buffer=/harness/short-ayahs.json&media=<audio in /cache>
+ * Buffer fixtures exercise presentation only, not ASR or extension routing.
  */
 (() => {
   const q = new URLSearchParams(location.search);
@@ -11,6 +13,7 @@
   const listeners = [];
   const changeListeners = [];
   const local = JSON.parse(sessionStorage.getItem('qltLocal') || '{}');
+  if (q.has('buffer')) local.qltRecognition = 'browser';
   window.__qlt = { listeners, local, sent: [] };
 
   const names = { 21: 'Al-Anbiyaa', 1: 'Al-Faatiha' };
@@ -46,15 +49,25 @@
     if (msg.type === 'PING_HELPER') {
       return view === 'helper' ? { ok: false } : { ok: true, model: 'openai/whisper-large-v3', device: 'cuda' };
     }
-    if (msg.type === 'TL_HELLO') return window.__qlt.timeline ? { timeline: window.__qlt.timeline } : {};
+    if (msg.type === 'TL_HELLO') {
+      if (window.__qlt.buffer) queueMicrotask(() => {
+        window.__qlt.deliver({ type: 'CARD_SHOW', mode: 'lookahead', status: 'listening' });
+        window.__qlt.deliver({ type: 'CARD_BUFFER', buffer: window.__qlt.buffer });
+      });
+      return window.__qlt.timeline ? { timeline: window.__qlt.timeline } : {};
+    }
     return { ok: true };
   }
 
   window.chrome = {
     runtime: {
+      id: 'ayah-sync-harness',
       getURL: (p) => '/' + p,
       sendMessage: (msg) => respond(msg),
-      onMessage: { addListener: (fn) => listeners.push(fn) },
+      onMessage: {
+        addListener: (fn) => listeners.push(fn),
+        removeListener: (fn) => { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); },
+      },
     },
     tabs: {
       query: async () => [{

@@ -27,6 +27,14 @@ const state = {
   mediaPlaying: true, // captured tab's play/pause state
   debug: null, // last human-readable working state (diagnostics)
   error: null,
+  backend: 'helper',
+  captureEpoch: 0,
+  buffered: null,
+  cpuAudioSource: null,
+  cpuAudioReady: false,
+  cpuAudioBatch: null,
+  cpuActivity: [],
+  cpuNetworkSession: null,
   // Whole-video sync: idle | working | ready | error
   sync: { status: 'idle', tabId: null, key: null, stage: null, pct: 0, summary: null, error: null },
 };
@@ -42,7 +50,11 @@ const HELPER_DOWN = 'The helper is not running. Open run.bat in the server folde
 const restored = chrome.storage.session
   .get('qltState')
   .then((r) => {
-    if (r?.qltState) Object.assign(state, r.qltState);
+    if (r?.qltState) {
+      for (const key of Object.keys(state)) {
+        if (Object.hasOwn(r.qltState, key)) state[key] = r.qltState[key];
+      }
+    }
     // A sync that was mid-flight when the worker was recycled lost its socket.
     if (state.sync?.status === 'working') {
       state.sync = { ...state.sync, status: 'error', error: 'The sync was interrupted. Try again.' };
@@ -69,7 +81,7 @@ async function ensureOffscreen() {
   if (await hasOffscreen()) return;
   await chrome.offscreen.createDocument({
     url: OFFSCREEN_URL,
-    reasons: ['USER_MEDIA'],
+    reasons: ['USER_MEDIA', 'WORKERS'],
     justification:
       'Capture the active tab audio to transcribe Quran recitation on-device.',
   });
@@ -114,21 +126,55 @@ function contentScriptFiles() {
 }
 
 // --- Content-script card control --------------------------------------------
+const contentInjections = new Map();
+async function reconnectContent(tabId) {
+  if (contentInjections.has(tabId)) return contentInjections.get(tabId);
+  const task = (async () => {
+    const files = contentScriptFiles();
+    if (!files.length) throw new Error('Content script is missing from the extension manifest.');
+    await chrome.scripting.executeScript({ target: { tabId }, files });
+    // The bundled loader imports its module asynchronously. Wait for the
+    // listener, not just executeScript(), before retrying the original request.
+    for (const delay of [0, 20, 50, 100, 200]) {
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      try {
+        const response = await chrome.tabs.sendMessage(tabId, { type: 'CONTENT_PING' });
+        if (response?.ok) return;
+      } catch {}
+    }
+    throw new Error('Could not reconnect to this video page. Refresh it and start sync again.');
+  })();
+  contentInjections.set(tabId, task);
+  try { return await task; }
+  finally { contentInjections.delete(tabId); }
+}
+
+async function askContent(tabId, message) {
+  try { return await chrome.tabs.sendMessage(tabId, message); }
+  catch {
+    await reconnectContent(tabId);
+    return chrome.tabs.sendMessage(tabId, message);
+  }
+}
+
 async function tellCard(tabId, message) {
   if (tabId == null) return;
+  try { await askContent(tabId, message); } catch {}
+}
+
+async function captureClock() {
+  const tabId = await resolveTabId();
+  if (!state.capturing || tabId == null) return null;
+  const epoch = state.captureEpoch;
+  let timer;
   try {
-    await chrome.tabs.sendMessage(tabId, message);
-  } catch {
-    // Content script missing (e.g. tab predates the extension load) — inject the
-    // real built file, then retry.
-    try {
-      const files = contentScriptFiles();
-      if (files.length) {
-        await chrome.scripting.executeScript({ target: { tabId }, files });
-        await chrome.tabs.sendMessage(tabId, message);
-      }
-    } catch {}
-  }
+    // A busy or frozen tab must not leave the caller waiting forever.
+    const clock = await Promise.race([
+      chrome.tabs.sendMessage(tabId, { type: 'CAPTURE_CLOCK' }),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), 1500); }),
+    ]);
+    return clock ? { ...clock, captureEpoch: epoch } : null;
+  } catch { return null; } finally { clearTimeout(timer); }
 }
 
 // --- Whole-video sync ---------------------------------------------------------
@@ -177,7 +223,7 @@ function pingHelper(timeoutMs = 1500) {
     ws.onmessage = (ev) => {
       try {
         const d = JSON.parse(ev.data);
-        if (d.type === 'ready') finish({ ok: true, model: d.model, device: d.device });
+        if (d.type === 'ready') finish({ ok: d.capabilities?.align !== false, model: d.model, device: d.device });
       } catch {}
     };
     ws.onerror = () => finish({ ok: false });
@@ -293,6 +339,8 @@ async function teardown() {
     } catch {}
     await closeOffscreen();
   }
+  await setCpuYoutubeNetwork(false).catch(() => {});
+  state.cpuNetworkSession = null;
   for (const t of new Set([state.tabId, state.displayTabId])) {
     if (t != null) {
       try {
@@ -301,27 +349,112 @@ async function teardown() {
     }
   }
   state.capturing = false;
+  state.captureEpoch++;
   state.tabId = null;
   state.displayTabId = null;
   state.status = 'idle';
   state.modelProgress = null;
+  state.preparationText = null;
+  state.buffered = null;
+  state.cpuAudioSource = null;
+  state.cpuAudioReady = false;
+  state.cpuAudioBatch = null;
+  state.cpuActivity = [];
 }
 
-async function startCapture() {
+async function cpuLookaheadAvailable() {
+  try {
+    const response = await fetch('http://127.0.0.1:8790/health', { signal: AbortSignal.timeout(350), cache: 'no-store' });
+    return response.ok && (await response.json()).cpu_audio === true;
+  } catch { return false; }
+}
+
+async function setCpuYoutubeNetwork(enabled) {
+  const id = 8791;
+  await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id], addRules: enabled ? [{
+    id, priority: 1,
+    condition: { initiatorDomains: [chrome.runtime.id], requestDomains: ['youtube.com', 'googlevideo.com'],
+      resourceTypes: ['xmlhttprequest'] },
+    action: { type: 'modifyHeaders', requestHeaders: [
+      { header: 'origin', operation: 'set', value: 'https://www.youtube.com' },
+      { header: 'referer', operation: 'set', value: 'https://www.youtube.com/' },
+    ] },
+  }] : [] });
+}
+
+async function startCpuLookahead(tab, page, { youtubeId = null, directMedia = false, mediaCredentials = 'omit',
+  helperAvailable = true, attempt = state.captureEpoch } = {}) {
+  const url = tab.url || page.href;
+  const { qltCPUHighlight = true } = await chrome.storage.local.get('qltCPUHighlight');
+  // Keep a live fallback usable after the popup closes. The offscreen document
+  // consumes this optional token now and keeps the captured tab audible.
+  let streamId = null;
+  if (youtubeId || directMedia) {
+    try { streamId = (await chrome.runtime.sendMessage({ type: 'CAPTURE_TOKEN', tabId: tab.id }))?.streamId || null; } catch {}
+  }
+  if (attempt !== state.captureEpoch) return;
+  await ensureOffscreen();
+  if (attempt !== state.captureEpoch) { if (!state.capturing) await closeOffscreen(); return; }
+  Object.assign(state, { capturing: true, tabId: tab.id, displayTabId: tab.id, backend: 'lookahead',
+    status: 'loading-model', error: null, lastMatch: null, buffered: null,
+    cpuAudioSource: youtubeId ? 'youtubejs' : directMedia ? 'direct' : 'helper',
+    debug: youtubeId ? 'CPU look-ahead · starting YouTube.js browser download…'
+      : directMedia ? 'CPU look-ahead · fetching standard media audio in browser…' : 'CPU look-ahead · fetching video audio in background…' });
+  recordCpuActivity(state.debug);
+  state.captureEpoch++;
+  await tellCard(tab.id, { type: 'CARD_SHOW', status: state.status, mode: 'lookahead' });
+  await tellCard(tab.id, { type: 'CARD_WATCH_MEDIA' });
+  await chrome.runtime.sendMessage({ target: 'offscreen', type: 'START_LOOKAHEAD', url,
+    media: page.src, startTime: page.time, key: videoKey(url), captureEpoch: state.captureEpoch, highlightEnabled: qltCPUHighlight,
+    youtubeId, directMedia, mediaCredentials, helperAvailable, expectedDuration: page.duration, streamId });
+  broadcastState(); updateBadge();
+}
+
+async function startCapture(targetTabId = null) {
   // Always start from a clean slate — releases any orphaned stream on this or a
   // previous tab so getMediaStreamId can't fail with "active stream".
   await teardown();
+  const attempt = state.captureEpoch;
   if (state.sync.status !== 'idle') await clearSync(); // one mode at a time
 
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tab = targetTabId == null ? (await chrome.tabs.query({ active: true, currentWindow: true }))[0]
+    : await chrome.tabs.get(targetTabId);
   if (!tab?.id) {
     setError('No active tab to capture.');
     return;
   }
 
+  const { qltRecognition = 'helper', qltCPULookahead = true } = await chrome.storage.local.get(['qltRecognition', 'qltCPULookahead']);
+  if (qltRecognition === 'browser' && qltCPULookahead) {
+    let page;
+    try { page = await askContent(tab.id, { type: 'TL_MEDIA' }); } catch (error) {
+      setError(error.message || 'Refresh the video page and start CPU sync again.');
+      return;
+    }
+    if (page && Number.isFinite(page.duration) && page.duration > 0 && /^https?:/.test(tab.url || page.href || '')) {
+      const helperAvailable = await cpuLookaheadAvailable();
+      if (attempt !== state.captureEpoch) return;
+      const youtubeId = page.duration <= 10 * 60 * 60 ? videoKey(tab.url || page.href).match(/^yt:([\w-]{11})$/)?.[1] : null;
+      let directMedia = false, mediaCredentials = 'omit';
+      try {
+        const media = new URL(page.src);
+        directMedia = !videoKey(tab.url || page.href).startsWith('yt:') && !page.encrypted && page.duration <= 36000 &&
+          ['http:', 'https:'].includes(media.protocol) && !media.username && !media.password && media.href.length <= 16384;
+        if (directMedia && await chrome.permissions?.contains({ origins: [`${media.protocol}//${media.hostname}/*`] })) mediaCredentials = 'include';
+      } catch {}
+      if (youtubeId || directMedia || helperAvailable) return startCpuLookahead(tab, page,
+        { youtubeId, directMedia, mediaCredentials, helperAvailable, attempt });
+    }
+  }
+
   let streamId;
   try {
-    streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
+    // Isolated extension documents and the MV3 service worker do not share a
+    // renderer. A SW-issued token fails with "Error starting tab capture"
+    // under COOP/COEP. The popup issues a token usable by the offscreen page.
+    const token = await chrome.runtime.sendMessage({ type: 'CAPTURE_TOKEN', tabId: tab.id });
+    if (!token?.streamId) throw new Error(token?.error || 'Keep the extension popup open while capture starts.');
+    streamId = token.streamId;
   } catch (err) {
     setError(
       `Could not start tab capture: ${err?.message || err}. ` +
@@ -338,14 +471,20 @@ async function startCapture() {
   state.status = 'loading-model';
   state.error = null;
   state.lastMatch = null;
+  state.debug = null;
+
+  state.backend = qltRecognition;
+  state.captureEpoch++;
 
   await chrome.runtime.sendMessage({
     target: 'offscreen',
     type: 'START_CAPTURE',
     streamId,
+    backend: qltRecognition,
+    captureEpoch: state.captureEpoch,
   });
 
-  await tellCard(tab.id, { type: 'CARD_SHOW', status: 'loading-model' });
+  await tellCard(tab.id, { type: 'CARD_SHOW', status: state.status });
   await tellCard(tab.id, { type: 'CARD_WATCH_MEDIA' }); // watch this tab's play/pause
   broadcastState();
   updateBadge();
@@ -358,6 +497,7 @@ async function stopCapture() {
 }
 
 function setError(msg) {
+  recordCpuActivity('CPU sync stopped due to an error.');
   state.error = msg;
   state.status = 'error';
   state.capturing = false;
@@ -366,16 +506,34 @@ function setError(msg) {
 }
 
 // --- UI feedback ------------------------------------------------------------
+function recordCpuActivity(text) {
+  if (!state.capturing || !['browser', 'lookahead'].includes(state.backend) || typeof text !== 'string' || !text.trim()) return;
+  text = text.replace(/(?:https?|wss?):\/\/\S+/g, '[URL]').trim().slice(0, 220);
+  // Update a phase's progress in place instead of filling the log with every
+  // percentage/elapsed-time update. Keep history across popup close/reopen.
+  const key = text.replace(/\d+(?:\.\d+)?/g, '#');
+  const last = state.cpuActivity.at(-1);
+  if (last?.key === key) last.text = text;
+  else state.cpuActivity = [...state.cpuActivity, { text, key, at: Date.now() }].slice(-8);
+}
+
 function updateBadge() {
   const on = state.capturing;
   chrome.action.setBadgeText({ text: on ? '●' : '' });
   chrome.action.setBadgeBackgroundColor({ color: on ? '#1f9d55' : '#000000' });
 }
 
-function broadcastState() {
+function broadcastState(immediate = false) {
   // Throttle to ~2.5×/s and coalesce bursts (the offscreen emits many DEBUG/
   // RESULT messages), so we don't flood messaging or thrash storage.
   const now = Date.now();
+  if (immediate) {
+    clearTimeout(broadcastTimer);
+    broadcastTimer = null;
+    lastBroadcast = now;
+    flushState();
+    return;
+  }
   const gap = now - lastBroadcast;
   if (gap >= 400) {
     lastBroadcast = now;
@@ -395,6 +553,90 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.target === 'offscreen') return;
 
   switch (msg?.type) {
+    case 'CPU_YT_NETWORK':
+      (async () => {
+        await restored;
+        if (sender.url !== chrome.runtime.getURL(OFFSCREEN_URL) ||
+            (msg.enabled && (!state.capturing || state.backend !== 'lookahead'))) return sendResponse({ ok: false });
+        if (msg.enabled === true) {
+          if (!/^[\da-f-]{36}$/.test(msg.sessionId || '')) return sendResponse({ ok: false });
+          state.cpuNetworkSession = msg.sessionId;
+          await setCpuYoutubeNetwork(true);
+        } else if (msg.sessionId === state.cpuNetworkSession) {
+          state.cpuNetworkSession = null;
+          await setCpuYoutubeNetwork(false);
+        }
+        // Persist ownership across service-worker suspension. An older source's
+        // cleanup must not remove a newer CPU download's network rule.
+        chrome.storage.session.set({ qltState: state }).catch(() => {});
+        sendResponse({ ok: true });
+      })().catch(() => sendResponse({ ok: false }));
+      return true;
+    case 'CPU_AUDIO_SOURCE':
+      if (sender.url === chrome.runtime.getURL(OFFSCREEN_URL) && state.capturing && state.backend === 'lookahead') {
+        state.cpuAudioSource = ['youtubejs', 'direct'].includes(msg.source) ? msg.source : 'helper';
+        state.cpuAudioReady = true;
+        recordCpuActivity(msg.source === 'youtubejs' ? 'First audio batch ready · YouTube.js'
+          : msg.source === 'direct' ? 'First audio batch ready · standard media' : 'Audio ready · local helper');
+        broadcastState();
+      }
+      return;
+    case 'CPU_AUDIO_BATCH': {
+      const p = msg.progress;
+      if (sender.url !== chrome.runtime.getURL(OFFSCREEN_URL) || !state.capturing || state.backend !== 'lookahead' ||
+          !p || !['background', 'seek'].includes(p.phase) || !Number.isFinite(p.start) || !Number.isFinite(p.end) ||
+          p.start < 0 || p.end <= p.start || p.end > 36000 || p.end - p.start > 1800 ||
+          !['session', 'attestation', 'download', 'decode', 'ready', 'failed'].includes(p.stage)) return;
+      const range = `${Math.floor(p.start / 60)}–${Math.ceil(p.end / 60)} min`;
+      const pct = p.stage === 'download' && p.total > 0 && Number.isFinite(p.received / p.total)
+        ? ` · ${Math.min(100, Math.round(p.received / p.total * 100))}%` : '';
+      const prefix = p.phase === 'seek' ? 'Preparing audio at seek' : 'Background audio';
+      const text = `${prefix} · ${range}${pct}${p.stage === 'ready' ? ' · cached' : p.stage === 'failed' ? ' · will retry when needed' : ''}`;
+      state.cpuAudioBatch = { ...p, text, lastReady: p.stage === 'ready'
+        ? { start: p.start, end: p.end } : state.cpuAudioBatch?.lastReady || null };
+      recordCpuActivity(text);
+      broadcastState();
+      return;
+    }
+    case 'CPU_LIVE_FALLBACK':
+      (async () => {
+        await restored;
+        if (sender.url !== chrome.runtime.getURL(OFFSCREEN_URL) || !state.capturing || state.backend !== 'lookahead') {
+          return sendResponse({ cancelled: true });
+        }
+        const tabId = state.tabId, epoch = state.captureEpoch;
+        let streamId = null;
+        if (!msg.hasStream) {
+          try { streamId = (await chrome.runtime.sendMessage({ type: 'CAPTURE_TOKEN', tabId }))?.streamId; } catch {}
+          if (!streamId) return sendResponse({ error: 'Browser downloading was unavailable. Reopen the popup, disable Auto CPU look-ahead, then start live listening.' });
+        }
+        if (!state.capturing || state.tabId !== tabId || state.captureEpoch !== epoch) return sendResponse({ cancelled: true });
+        Object.assign(state, { backend: 'browser', cpuAudioSource: 'live', buffered: null, lastMatch: null,
+          cpuAudioReady: false, cpuAudioBatch: null, status: 'loading-model', preparationText: null, debug: 'Browser download unavailable · listening live instead' });
+        recordCpuActivity(state.debug);
+        await tellCard(tabId, { type: 'CARD_HIDE' });
+        await tellCard(tabId, { type: 'CARD_SHOW', status: state.status });
+        broadcastState();
+        sendResponse({ ok: true, streamId });
+      })().catch(() => sendResponse({ error: 'Could not switch to CPU live listening.' }));
+      return true;
+    case 'CAPTURE_CLOCK':
+      captureClock().then(sendResponse);
+      return true;
+    case 'CAPTURE_RESET':
+      (async () => {
+        const capId = await resolveTabId();
+        if (state.capturing && sender?.tab?.id === capId) {
+          state.lastMatch = null;
+          state.buffered = null;
+          state.captureEpoch++;
+          state.debug = 'Seeking — confirming the new passage…';
+          broadcastState();
+          chrome.runtime.sendMessage({ target: 'offscreen', type: 'RESET_CAPTURE', captureEpoch: state.captureEpoch,
+            time: Number.isFinite(msg.time) ? msg.time : null }).catch(() => {});
+        }
+      })();
+      return true;
     case 'TR_GET':
       // Translations in other languages ship inside the extension (public/tr).
       (async () => {
@@ -419,7 +661,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'FONT_GET':
       (async () => {
         try {
-          const buf = await (await fetch(chrome.runtime.getURL(`fonts/${msg.file}`))).arrayBuffer();
+          if (!['uthmani.woff2', 'indopak.woff2', 'figtree.woff2'].includes(msg.file)) return sendResponse({});
+          const response = await fetch(chrome.runtime.getURL(`fonts/${msg.file}`));
+          if (!response.ok) throw new Error('Bundled font missing');
+          const buf = await response.arrayBuffer();
           let bin = '';
           const bytes = new Uint8Array(buf);
           for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
@@ -431,7 +676,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case 'PING_HELPER':
-      pingHelper().then(sendResponse);
+      (async () => {
+        // Also enforce this here: a stale popup or another extension context
+        // must not open a loopback socket while browser-only mode is selected.
+        const { qltRecognition = 'helper' } = await chrome.storage.local.get('qltRecognition');
+        sendResponse(qltRecognition === 'browser' ? { ok: false, disabled: true } : await pingHelper());
+      })();
       return true;
 
     case 'SYNC_START':
@@ -451,7 +701,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const k = `qltTL_${id}`;
         const r = id != null ? await chrome.storage.session.get(k).catch(() => ({})) : {};
         const saved = r[k];
-        sendResponse(saved && saved.key === videoKey(msg.url || '') ? { timeline: saved.timeline } : {});
+        if (saved && saved.key === videoKey(msg.url || '')) {
+          sendResponse({ timeline: saved.timeline });
+        } else {
+          sendResponse({});
+        }
       })();
       return true;
 
@@ -462,10 +716,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const capId = await resolveTabId();
         if (sender?.tab?.id != null && sender.tab.id === capId) {
           state.mediaPlaying = msg.playing !== false;
+          chrome.runtime.sendMessage({ target: 'offscreen', type: 'MEDIA_PLAYING', playing: state.mediaPlaying }).catch(() => {});
           const disp = await resolveDisplayTabId();
           if (disp != null) tellCard(disp, { type: 'CARD_MEDIA', playing: state.mediaPlaying });
+          broadcastState();
         }
       })();
+      return true;
+    case 'BUFFER_POSITION':
+      if (sender?.tab?.id === state.tabId && state.backend === 'lookahead' && state.capturing &&
+          msg.captureEpoch === state.captureEpoch && msg.match) {
+        const changed = state.lastMatch?.ref !== msg.match.ref;
+        state.lastMatch = msg.match;
+        broadcastState(changed);
+      }
       return true;
     case 'GET_STATE':
       // Reconcile with reality: the offscreen document existing is the source of
@@ -485,8 +749,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case 'START':
-      startCapture();
+      startCapture().catch((error) => {
+        setError(error.message || String(error));
+        closeOffscreen();
+      });
       sendResponse?.({ ok: true });
+      return true;
+
+    case 'CPU_RESTART_VIDEO':
+      (async () => {
+        const { qltRecognition } = await chrome.storage.local.get('qltRecognition');
+        if (qltRecognition !== 'browser' || sender?.tab?.id == null) {
+          sendResponse({ error: 'This button is only available for Browser CPU.' });
+          return;
+        }
+        try {
+          await startCapture(sender.tab.id);
+          if (state.error) {
+            await tellCard(sender.tab.id, { type: 'CARD_SHOW', status: 'error' });
+            await tellCard(sender.tab.id, { type: 'CARD_STATUS', status: 'error', error: state.error });
+          }
+          sendResponse(state.error ? { error: state.error } : { ok: true });
+        } catch (error) {
+          await tellCard(sender.tab.id, { type: 'CARD_SHOW', status: 'error' });
+          sendResponse({ error: error.message || String(error) });
+        }
+      })();
       return true;
 
     case 'STOP':
@@ -497,11 +785,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // --- messages coming FROM the offscreen document ---
     case 'STATUS':
       state.status = msg.status;
+      state.preparationText = msg.detail || null;
+      recordCpuActivity(msg.detail || (msg.status === 'loading-model' ? 'Loading CPU model…'
+        : msg.status === 'listening' ? state.backend === 'lookahead' ? 'Preparing the look-ahead buffer…' : 'Live CPU recognition ready' : ''));
       if (msg.status === 'stopped') state.capturing = false;
       broadcastState();
       (async () => {
         const tabId = await resolveDisplayTabId();
-        if (tabId != null) tellCard(tabId, { type: 'CARD_STATUS', status: msg.status });
+        if (tabId != null) tellCard(tabId, { type: 'CARD_STATUS', status: msg.status, detail: msg.detail });
       })();
       return true;
 
@@ -511,26 +802,62 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       (async () => {
         const tabId = await resolveDisplayTabId();
         if (tabId != null)
-          tellCard(tabId, { type: 'CARD_STATUS', status: 'loading-model', progress: msg.progress });
+          tellCard(tabId, { type: 'CARD_STATUS', status: 'loading-model', progress: msg.progress, detail: state.preparationText });
       })();
       return true;
 
     case 'RESULT':
       (async () => {
         const tabId = await resolveDisplayTabId();
+        let ayahChanged = false;
         if (msg.match) {
-          state.lastMatch = msg.match;
-          if (tabId != null) tellCard(tabId, { type: 'CARD_UPDATE', match: msg.match });
+          if (msg.captureEpoch != null && (!state.capturing || msg.captureEpoch !== state.captureEpoch)) return;
+          if (msg.clock && msg.clock.captureEpoch !== state.captureEpoch) return;
+          if (msg.clock && (!state.capturing || msg.clock.captureEpoch !== state.captureEpoch)) return;
+          ayahChanged = state.lastMatch?.ref !== msg.match.ref;
+          state.lastMatch = state.backend === 'browser' ? { ...msg.match, highlight: msg.highlight || null } : msg.match;
+          if (tabId != null) tellCard(tabId, { type: 'CARD_UPDATE', match: state.lastMatch });
         } else if (tabId != null) {
           tellCard(tabId, { type: 'CARD_STATUS', status: 'listening' });
         }
+        broadcastState(state.backend === 'browser' && ayahChanged);
+      })();
+      return true;
+
+    case 'HIGHLIGHT':
+      (async () => {
+        const tabId = await resolveDisplayTabId();
+        if (!state.capturing || state.backend !== 'browser' || !state.lastMatch) return;
+        if (msg.captureEpoch != null && msg.captureEpoch !== state.captureEpoch) return;
+        if (msg.clock && msg.clock.captureEpoch !== state.captureEpoch) return;
+        if (msg.highlight && msg.highlight.ref !== state.lastMatch.ref) return;
+        state.lastMatch = { ...state.lastMatch, highlight: msg.highlight || null };
+        if (tabId != null) tellCard(tabId, { type: 'CARD_HIGHLIGHT', highlight: msg.highlight || null });
         broadcastState();
       })();
       return true;
 
     case 'DEBUG':
       state.debug = msg.text;
+      if (/(?:YouTube\.js|Direct media).*(?:blocked|unavailable)|trying the local audio helper/i.test(msg.text || '')) recordCpuActivity(msg.text);
       broadcastState();
+      if (state.capturing && ['browser', 'lookahead'].includes(state.backend)) {
+        (async () => {
+          const tabId = await resolveDisplayTabId();
+          if (tabId != null) tellCard(tabId, { type: 'CARD_DEBUG', text: msg.text });
+        })();
+      }
+      return true;
+
+    case 'BUFFER':
+      (async () => {
+        const tabId = await resolveTabId();
+        if (!state.capturing || state.backend !== 'lookahead' || msg.captureEpoch !== state.captureEpoch) return;
+        if (msg.ready && !state.buffered?.ready) recordCpuActivity('Look-ahead buffer ready · following video playback');
+        state.buffered = msg;
+        if (tabId != null) tellCard(tabId, { type: 'CARD_BUFFER', buffer: msg });
+        broadcastState();
+      })();
       return true;
 
     case 'ERROR':
@@ -539,6 +866,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const tabId = await resolveDisplayTabId();
         if (tabId != null)
           tellCard(tabId, { type: 'CARD_STATUS', status: 'error', error: msg.error });
+        await closeOffscreen(); // Do not report a stopped recognizer as an orphaned active capture.
       })();
       return true;
   }
@@ -546,6 +874,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // --- Card follows the active tab -------------------------------------------
 async function moveCardTo(tabId) {
+  if (state.backend === 'lookahead') return; // Timed display follows its source video's clock.
   if (!state.capturing || tabId == null || tabId === state.displayTabId) return;
   const prev = state.displayTabId;
   state.displayTabId = tabId;
@@ -582,3 +911,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.runtime.onInstalled.addListener(updateBadge);
 chrome.runtime.onStartup.addListener(updateBadge);
+
+// Offscreen documents only expose chrome.runtime, not chrome.storage. Forward
+// this CPU-only preference through the existing background/offscreen channel.
+chrome.storage.onChanged.addListener(async (changes, area) => {
+  if (area !== 'local' || !changes.qltCPUHighlight) return;
+  await restored;
+  if (state.capturing && state.backend === 'lookahead') {
+    chrome.runtime.sendMessage({ target: 'offscreen', type: 'CPU_HIGHLIGHT_SETTING',
+      enabled: changes.qltCPUHighlight.newValue !== false }).catch(() => {});
+  }
+});

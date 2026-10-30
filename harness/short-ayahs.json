@@ -1,0 +1,8 @@
+{
+  "cues": [
+    { "t0": 0, "match": { "ref": "112:1", "surah": 112, "ayah": 1, "arabic": "قُلْ هُوَ ٱللَّهُ أَحَدٌ", "surahMeta": { "englishName": "Al-Ikhlaas" } }, "words": [] },
+    { "t0": 2, "match": { "ref": "112:2", "surah": 112, "ayah": 2, "arabic": "ٱللَّهُ ٱلصَّمَدُ", "surahMeta": { "englishName": "Al-Ikhlaas" } }, "words": [] },
+    { "t0": 2.4, "match": { "ref": "112:3", "surah": 112, "ayah": 3, "arabic": "لَمْ يَلِدْ وَلَمْ يُولَدْ", "surahMeta": { "englishName": "Al-Ikhlaas" } }, "words": [] },
+    { "t0": 3.2, "match": { "ref": "112:4", "surah": 112, "ayah": 4, "arabic": "وَلَمْ يَكُن لَّهُۥ كُفُوًا أَحَدٌ", "surahMeta": { "englishName": "Al-Ikhlaas" } }, "words": [] }
+  ]
+}

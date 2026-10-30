@@ -22,13 +22,22 @@
       (async () => {
         const q = new URLSearchParams(location.search);
         const v = document.getElementById('v');
-        v.src = '/cache/' + q.get('media');
+        v.src = new URL(q.get('media'), location.origin + '/cache/').href;
         await new Promise((r) => v.addEventListener('loadedmetadata', r, { once: true }));
-        const tl = await (await fetch('/cache/' + q.get('tl'))).json();
-        tl.duration ||= v.duration;
-        window.__qlt.timeline = tl;
-        document.getElementById('info').textContent =
-          `${tl.ayahs.length} ayahs · ${Math.round(v.duration)}s · ` + (tl.passages || []).map((p) => `${p.from}→${p.to}`).join(', ');
+        if (q.has('buffer')) {
+          const fixture = await (await fetch(q.get('buffer'))).json();
+          window.__qlt.buffer = { ...fixture, key: location.origin + location.pathname,
+            duration: v.duration, from: 0, until: v.duration, cueFrom: 0, cueUntil: v.duration,
+            ready: true, segmentId: 1, captureEpoch: 1, ranges: [{ id: 1, from: 0, until: v.duration }],
+            marks: fixture.cues.map((c) => c.t0) };
+          document.getElementById('info').textContent = `${fixture.cues.length} CPU fixture cues · UI only, no recognition`;
+        } else {
+          const tl = await (await fetch('/cache/' + q.get('tl'))).json();
+          tl.duration ||= v.duration;
+          window.__qlt.timeline = tl;
+          document.getElementById('info').textContent =
+            `${tl.ayahs.length} ayahs · ${Math.round(v.duration)}s · ` + (tl.passages || []).map((p) => `${p.from}→${p.to}`).join(', ');
+        }
         for (const src of ['__BRIDGE_SCRIPT__', '__CONTENT_SCRIPT__']) {
           const s = document.createElement('script');
           s.src = src;

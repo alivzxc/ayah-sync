@@ -1,0 +1,4 @@
+# Lightweight download-only helper. ffmpeg and ffprobe must also be on PATH.
+websockets>=12
+numpy>=1.24
+yt-dlp

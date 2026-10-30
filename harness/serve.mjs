@@ -17,7 +17,7 @@ import { dirname, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const PORT = 5190;
+const PORT = Number(process.env.PORT || 5190);
 const TYPES = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript',
   '.css': 'text/css', '.json': 'application/json', '.woff2': 'font/woff2', '.png': 'image/png',
@@ -71,4 +71,4 @@ createServer((req, res) => {
   } else {
     sendFile(req, res, safe(join(root, 'dist'), path));
   }
-}).listen(PORT, () => console.log(`harness on http://localhost:${PORT}`));
+}).listen(PORT, function () { console.log(`harness on http://localhost:${this.address().port}`); });

@@ -1,3 +1,8 @@
+import { displayWordIndices } from '../cpu/display-word.js';
+import { displayTiming } from '../cpu/display-timing.js';
+import { CPU_LOOKAHEAD_SECONDS } from '../cpu/startup-buffer.js';
+const DEV_MODE = import.meta.env.DEV;
+
 /**
  * Content script: the verse card.
  *
@@ -57,11 +62,66 @@ let prevWord = 0;
 let prevTime = 0;
 let liveRaf = null;
 let mediaPlaying = true;
+let browserCPU = false;
+let cpuHighlight = true;
+let cpuLookaheadPreference = true;
+let cpuHighlightPreference;
+let highlightTimer = null;
+let cpuBuffer = null;
+const cpuSegments = new Map();
+let bufferRaf = null;
+let bufferedWord = -2;
+let bufferedRef = null;
+let cpuBufferedMode = false;
 const MAX_DRIFT_MS = 7000;
 const MAX_LEAD = 4;
+const contentLifecycle = new AbortController();
+let disposed = false;
+let mediaTimer = null;
+
+function disposeContent() {
+  if (disposed) return;
+  disposed = true;
+  contentLifecycle.abort();
+  clearInterval(mediaTimer);
+  mediaTimer = null;
+  clearTimeline();
+  hideCard();
+  try { chrome.runtime.onMessage.removeListener(onRuntimeMessage); } catch {}
+}
+
+function extensionAvailable() {
+  if (disposed) return false;
+  try { if (chrome.runtime?.id) return true; } catch {}
+  disposeContent();
+  return false;
+}
+
+function runtimeMessage(message) {
+  if (!extensionAvailable()) return Promise.resolve(null);
+  const invalidated = (error) => {
+    if (/extension context invalidated/i.test(error?.message || '')) {
+      disposeContent();
+      return null;
+    }
+    throw error;
+  };
+  // sendMessage can throw synchronously after an extension reload, before an
+  // ordinary .catch() can run. Old page scripts must stop, not keep painting.
+  try { return chrome.runtime.sendMessage(message).catch(invalidated); }
+  catch (error) {
+    try { return Promise.resolve(invalidated(error)); }
+    catch (other) { return Promise.reject(other); }
+  }
+}
 
 // =============================================================== preferences
-chrome.storage?.local.get(['showTranslation', 'qltScript', 'qltFontSize', 'qltCardWidth', 'qltAmbient', 'qltLang'], (v) => {
+chrome.storage?.local.get(['showTranslation', 'qltScript', 'qltFontSize', 'qltCardWidth', 'qltAmbient', 'qltLang', 'qltRecognition', 'qltCPUHighlight', 'qltCPULookahead'], (v) => {
+  if (disposed) return;
+  browserCPU = v?.qltRecognition === 'browser';
+  cpuLookaheadPreference = v?.qltCPULookahead !== false;
+  cpuHighlightPreference = v?.qltCPUHighlight;
+  cpuHighlight = cpuHighlightPreference ?? cpuLookaheadPreference;
   if (v?.qltLang) lang = v.qltLang;
   ambient = v?.qltAmbient !== false;
   showTranslation = v?.showTranslation !== false;
@@ -72,7 +132,17 @@ chrome.storage?.local.get(['showTranslation', 'qltScript', 'qltFontSize', 'qltCa
   rerender();
 });
 chrome.storage?.onChanged.addListener((changes, area) => {
+  if (disposed) return;
   if (area !== 'local') return;
+  if (changes.qltRecognition || changes.qltCPUHighlight || changes.qltCPULookahead) {
+    if (changes.qltRecognition) browserCPU = changes.qltRecognition.newValue === 'browser';
+    if (changes.qltCPUHighlight) cpuHighlightPreference = changes.qltCPUHighlight.newValue;
+    if (changes.qltCPULookahead) cpuLookaheadPreference = changes.qltCPULookahead.newValue !== false;
+    cpuHighlight = cpuHighlightPreference ?? cpuLookaheadPreference;
+    if (cpuBuffer) bufferedWord = -2;
+    else if (liveMatch) showLive(liveMatch);
+    else if (browserCPU && !tl) paintWords(Infinity);
+  }
   if (changes.showTranslation) showTranslation = changes.showTranslation.newValue !== false;
   if (changes.qltScript) script = changes.qltScript.newValue || 'uthmani';
   if (changes.qltFontSize) fontSize = changes.qltFontSize.newValue || 24;
@@ -109,6 +179,8 @@ function rerender() {
   shown = null;
   builtText = '';
   renderAyah(a, a.__next || null);
+  if (cpuBuffer) bufferedWord = -2;
+  else if (!tl && browserCPU && liveMatch) paintCpuHighlight(liveMatch.highlight);
 }
 
 // ===================================================================== fonts
@@ -126,16 +198,13 @@ function fetchFonts() {
   if (fontBytes) return fontBytes;
   fontBytes = Promise.all(
     FONT_FILES.map(async ([name, file, desc]) => {
-      let buf;
-      try {
-        buf = await (await fetch(chrome.runtime.getURL(`fonts/${file}`))).arrayBuffer();
-      } catch {
-        // The page's own security policy blocked the request: get the bytes
-        // through the service worker instead.
-        const r = await chrome.runtime.sendMessage({ type: 'FONT_GET', file });
-        const bin = atob(r?.b64 || '');
-        buf = Uint8Array.from(bin, (c) => c.charCodeAt(0)).buffer;
-      }
+      // Fetch in the extension, not the host page's security context. Direct
+      // extension URLs can be rejected by sites such as YouTube even when the
+      // files are web-accessible; falling back afterwards still logs errors.
+      const r = await runtimeMessage({ type: 'FONT_GET', file });
+      if (!r?.b64) throw new Error(`Bundled font unavailable: ${file}`);
+      const bin = atob(r.b64);
+      const buf = Uint8Array.from(bin, (c) => c.charCodeAt(0)).buffer;
       return [name, buf, desc];
     }),
   );
@@ -160,18 +229,17 @@ async function installFonts(win) {
 function ensureCard() {
   if (host && host.isConnected) return;
 
+  // A previous extension build can leave an orphaned card in an existing tab.
+  // Only the newly connected content script may own this page's card.
+  document.querySelectorAll(`#${HOST_ID}`).forEach((node) => node.remove());
+
   host = document.createElement('div');
   host.id = HOST_ID;
   host.style.cssText = 'all:initial; position:fixed; z-index:2147483647; top:76px; right:24px;';
   shadow = host.attachShadow({ mode: 'open' });
 
-  const font = (f) => chrome.runtime.getURL(`fonts/${f}`);
   shadow.innerHTML = `
     <style>
-      @font-face { font-family:'QLT-Uthmani'; src:url('${font('uthmani.woff2')}') format('woff2'); font-display:swap; }
-      @font-face { font-family:'QLT-IndoPak'; src:url('${font('indopak.woff2')}') format('woff2'); font-display:swap; }
-      @font-face { font-family:'QLT-Text'; src:url('${font('figtree.woff2')}') format('woff2'); font-weight:400 700; font-display:swap; }
-
       :host {
         all: initial;
         --ar-size: 24px; --card-w: 360px;
@@ -209,9 +277,12 @@ function ensureCard() {
       /* Passage ribbon: where we are in the video, with a notch per ayah. */
       .ribbon { position: relative; height: 14px; cursor: pointer; background: var(--paper-2); border-bottom: 1px solid var(--rule); }
       .ribbon .span { position: absolute; top: 6px; height: 2px; background: var(--ink-3); opacity: .55; border-radius: 1px; }
+      .ribbon[data-mode="cpu"] .span { background: var(--green); opacity: .7; }
       .ribbon .tick { position: absolute; top: 4px; width: 1px; height: 6px; background: var(--ink-3); }
       .ribbon .fill { position: absolute; top: 6px; left: 0; height: 2px; background: var(--green); border-radius: 1px; }
       .ribbon .head { position: absolute; top: 3px; width: 2px; height: 8px; margin-left: -1px; background: var(--green); border-radius: 1px; }
+      .ribbon-label { position: absolute; inset: 0; text-align: center; font-size: 10px; line-height: 14px; color: var(--ink-2); pointer-events: none; }
+      .sync-note { padding: 5px 14px 0; font-size: 11px; color: var(--ink-2); }
 
       .bar { display: flex; align-items: center; gap: 6px; padding: 9px 8px 0 14px; cursor: grab; user-select: none; }
       .bar:active { cursor: grabbing; }
@@ -236,6 +307,10 @@ function ensureCard() {
 
       .body { padding: 6px 18px 16px; }
       .status { font-size: 14px; line-height: 1.5; color: var(--ink-2); padding: 8px 0 2px; }
+      .restart-cpu { margin-top: 10px; padding: 8px 14px; border: 1px solid var(--green); border-radius: 8px; background: var(--wash); color: var(--ink); font: inherit; cursor: pointer; }
+      .restart-cpu:disabled { cursor: wait; }
+      .diag { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--rule); color: var(--ink-3);
+        font: 500 10.5px/1.4 'QLT-Text', system-ui, sans-serif; overflow-wrap: anywhere; }
       .arabic {
         direction: rtl; text-align: right; font-family: var(--ar-font);
         font-size: var(--ar-size); line-height: 2.05; color: var(--ink); padding-top: 2px;
@@ -291,9 +366,11 @@ function ensureCard() {
       </div>
       <div class="body">
         <div class="status" id="status">Starting…</div>
+        <button class="restart-cpu hidden" id="restartCpu">Sync this video</button>
         <div id="verse" class="hidden">
           <div class="arabic" id="arabic" lang="ar"></div>
           <div class="trans" id="trans" dir="auto"></div>
+          <div class="diag hidden" id="debug"></div>
           <div class="next hidden" id="nextWrap">
             <div class="lbl">Next</div>
             <div class="arabic" id="nextArabic" lang="ar"></div>
@@ -310,32 +387,51 @@ function ensureCard() {
     ribbon: $('ribbon'), spans: $('spans'), fill: $('fill'), head: $('head'),
     bar: $('bar'), where: $('where'), seek: $('seek'),
     prev: $('prev'), again: $('again'), next: $('nextBtn'), close: $('close'), pop: $('pop'), play: $('playBtn'), icoPlay: $('icoPlay'), icoPause: $('icoPause'), card: shadow.querySelector('.card'),
-    status: $('status'), verse: $('verse'), arabic: $('arabic'), trans: $('trans'),
+    status: $('status'), restartCpu: $('restartCpu'), verse: $('verse'), arabic: $('arabic'), trans: $('trans'), debug: $('debug'),
     nextWrap: $('nextWrap'), nextArabic: $('nextArabic'),
   };
 
   els.close.addEventListener('click', () => {
     if (tl) {
       clearTimeline();
-      chrome.runtime.sendMessage({ type: 'SYNC_CLEAR' }).catch(() => {});
+      runtimeMessage({ type: 'SYNC_CLEAR' }).catch(() => {});
     } else {
-      chrome.runtime.sendMessage({ type: 'STOP' }).catch(() => {});
+      runtimeMessage({ type: 'STOP' }).catch(() => {});
     }
     hideCard();
   });
   els.pop.addEventListener('click', togglePip);
   els.play.addEventListener('click', toggleMedia);
+  els.restartCpu.addEventListener('click', async () => {
+    if (!browserCPU || els.restartCpu.disabled) return;
+    els.restartCpu.disabled = true;
+    els.restartCpu.textContent = 'Starting CPU sync…';
+    try {
+      const result = await runtimeMessage({ type: 'CPU_RESTART_VIDEO' });
+      if (result?.error) throw new Error(result.error);
+    } catch (error) {
+      if (!els) return;
+      setStatus(error.message || 'Could not start CPU sync.', 'err');
+      els.restartCpu.disabled = false;
+      els.restartCpu.textContent = 'Try CPU sync again';
+      els.restartCpu.classList.remove('hidden');
+    }
+  });
   els.prev.addEventListener('click', () => seekAyah(-1));
   els.again.addEventListener('click', () => seekAyah(0));
   els.next.addEventListener('click', () => seekAyah(1));
   els.ribbon.addEventListener('click', (e) => {
     const v = findVideo();
-    if (!tl || !v) return;
+    if (!v || (!tl && (!cpuBuffer || videoKey(location.href) !== cpuBuffer.key))) return;
     const r = els.ribbon.getBoundingClientRect();
-    const t = ((e.clientX - r.left) / r.width) * tl.duration;
+    const duration = tl?.duration ?? cpuBuffer.duration;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    const t = Math.max(0, Math.min(duration, ((e.clientX - r.left) / r.width) * duration));
     // Snap to the start of the ayah under the pointer.
-    const i = ayahIndexAt(t);
-    v.currentTime = Math.max(0, (i >= 0 ? tl.ayahs[i].t0 : t) - 0.05);
+    if (tl) {
+      const i = ayahIndexAt(t);
+      v.currentTime = Math.max(0, (i >= 0 ? tl.ayahs[i].t0 : t) - 0.05);
+    } else v.currentTime = t;
   });
 
   // Resize from either side edge or the bottom corners (height follows content).
@@ -374,15 +470,16 @@ function ensureCard() {
       host.style.top = `${e.clientY - dragState.dy}px`;
       host.style.right = 'auto';
     }
-  });
+  }, { signal: contentLifecycle.signal });
   window.addEventListener('mouseup', () => {
+    if (!extensionAvailable()) return;
     if (!host || (!rz && !dragState)) return;
     const save = { cardPos: { left: host.style.left, top: host.style.top } };
     if (rz) save.qltCardWidth = cardWidth;
     rz = null;
     dragState = null;
     if (host.style.left) chrome.storage?.local.set(save);
-  });
+  }, { signal: contentLifecycle.signal });
 
   applyPrefs();
   installFonts(window);
@@ -407,7 +504,7 @@ function toggleMedia() {
     if (v.paused) v.play().catch(() => {});
     else v.pause();
   } else {
-    chrome.runtime.sendMessage({ type: 'MEDIA_TOGGLE' }).catch(() => {});
+    runtimeMessage({ type: 'MEDIA_TOGGLE' }).catch(() => {});
   }
 }
 
@@ -447,7 +544,7 @@ document.addEventListener('qlt-pip-opened', () => {
       .join('');
   els.card.classList.add('pip');
   restartLoops();
-});
+}, { signal: contentLifecycle.signal });
 document.addEventListener('qlt-pip-closed', () => {
   inPip = false;
   if (!host || host.dataset.pipGone) return;
@@ -455,27 +552,34 @@ document.addEventListener('qlt-pip-closed', () => {
   els.card.classList.remove('pip');
   applyPrefs();
   restartLoops();
-});
+}, { signal: contentLifecycle.signal });
 document.addEventListener('qlt-pip-error', () => {
   if (els) els.pop.title = 'Floating window is not available in this browser';
-});
+}, { signal: contentLifecycle.signal });
 // Keys pressed in the floating window: space pauses, arrows step through ayahs.
 document.addEventListener('qlt-pip-key', () => {
   const key = host?.dataset.pipKey;
   if (key === 'space') toggleMedia();
   else if (key === 'prev') seekAyah(-1);
   else if (key === 'next') seekAyah(1);
-});
+}, { signal: contentLifecycle.signal });
 
 function restartLoops() {
   caf(tlRaf);
   caf(liveRaf);
   tlRaf = liveRaf = null;
   if (tl) tlRaf = raf(tlTick);
-  if (liveMatch) liveRaf = raf(liveTick);
+  if (liveMatch && !browserCPU) liveRaf = raf(liveTick);
+  caf(bufferRaf);
+  bufferRaf = cpuBuffer ? raf(bufferTick) : null;
 }
 
 function hideCard() {
+  caf(bufferRaf);
+  bufferRaf = null;
+  cpuBuffer = null;
+  cpuSegments.clear();
+  bufferedRef = null;
   if (inPip && host) {
     host.dataset.pipGone = '1';
     inPip = false;
@@ -484,6 +588,7 @@ function hideCard() {
   caf(liveRaf);
   liveRaf = null;
   liveMatch = null;
+  clearTimeout(highlightTimer);
   shown = null;
   builtText = '';
   wordEls = [];
@@ -499,6 +604,7 @@ function setStatus(text, tone) {
   els.verse.classList.add('hidden');
   els.status.classList.remove('hidden');
   els.status.textContent = text;
+  els.restartCpu.classList.add('hidden');
   els.where.innerHTML = `<span class="live ${tone || 'wait'}"></span>Ayah Sync`;
   shown = null;
   builtText = '';
@@ -610,8 +716,7 @@ function loadTranslations(refs) {
   refs = [...new Set(refs.filter((r) => r && !trMap[r]))];
   if (lang === 'en' || !refs.length) return;
   const asked = lang;
-  chrome.runtime
-    .sendMessage({ type: 'TR_GET', lang, refs })
+  runtimeMessage({ type: 'TR_GET', lang, refs })
     .then((r) => {
       if (!r?.map || asked !== lang) return;
       Object.assign(trMap, r.map);
@@ -624,13 +729,18 @@ function loadTranslations(refs) {
 function renderAyah(a, next) {
   ensureCard();
   const text = arabicOf(a);
-  if (shown && shown.ref === a.ref && text === builtText && shown.__next === next) return;
+  if (shown && shown.ref === a.ref && text === builtText && shown.__next?.ref === next?.ref) {
+    a.__next = next;
+    shown = a;
+    return;
+  }
   if (lang !== 'en' && !trMap[a.ref]) loadTranslations([a.ref, next?.ref]);
   a.__next = next;
   shown = a;
   builtText = text;
 
   els.status.classList.add('hidden');
+  els.restartCpu.classList.add('hidden');
   els.verse.classList.remove('hidden');
   const meta = a.surahMeta || {};
   const name = meta.englishName || `Surah ${a.surah}`;
@@ -663,13 +773,17 @@ function renderAyah(a, next) {
   const nextText = next ? arabicOf(next) : '';
   els.nextWrap.classList.toggle('hidden', !nextText);
   if (nextText) els.nextArabic.textContent = nextText;
+  if (browserCPU && !cpuHighlight && !tl) paintWords(Infinity);
 }
 
 /** cur = index of the word being recited (-1: none yet, Infinity: all done). */
 function paintWords(cur) {
+  if (browserCPU && !cpuHighlight && !tl) cur = Infinity;
+  const indices = Array.isArray(cur) ? cur : null;
+  const first = indices ? indices[0] : cur;
   for (let i = 0; i < wordEls.length; i++) {
     const el = wordEls[i];
-    const state = i < cur ? 1 : i === cur ? 2 : 0;
+    const state = (indices ? indices.includes(i) : i === cur) ? 2 : browserCPU && !tl ? 1 : i < first ? 1 : 0;
     if (el._s === state) continue;
     el._s = state;
     el.classList.toggle('done', state === 1);
@@ -705,8 +819,7 @@ function findVideo() {
   return best;
 }
 
-function ayahIndexAt(t) {
-  const a = tl.ayahs;
+function ayahIndexAt(t, a = tl?.ayahs || []) {
   let lo = 0;
   let hi = a.length - 1;
   let ans = -1;
@@ -727,16 +840,24 @@ function clock(t) {
 
 function loadTimeline(timeline) {
   if (!timeline?.ayahs?.length) return;
+  clearTimeout(highlightTimer);
   caf(liveRaf);
   liveRaf = null;
   liveMatch = null;
   tl = timeline;
+  cpuSegments.clear();
   tlIdx = -2;
   lastHref = location.href;
   ensureCard();
   loadTranslations(tl.ayahs.map((a) => a.ref));
   els.seek.classList.remove('hidden');
   els.ribbon.classList.remove('hidden');
+  delete els.ribbon.dataset.mode;
+  els.ribbon.title = 'Jump to an ayah';
+  for (const button of [els.prev, els.again, els.next]) button.disabled = false;
+  els.prev.title = 'Previous ayah';
+  els.again.title = 'Repeat this ayah';
+  els.next.title = 'Next ayah';
   // Ribbon: a line per recited passage, a notch at each ayah start.
   const pct = (t) => `${Math.min(100, (t / tl.duration) * 100).toFixed(3)}%`;
   els.spans.textContent = '';
@@ -769,6 +890,7 @@ function clearTimeline() {
 }
 
 function tlTick() {
+  if (!extensionAvailable()) return;
   if (!tl) return;
   tlRaf = raf(tlTick);
 
@@ -830,20 +952,20 @@ function tlTick() {
 
 function seekAyah(dir) {
   const v = findVideo();
-  if (!tl || !v) return;
+  const entries = tl?.ayahs;
+  if (!entries?.length || !v) return;
   const t = v.currentTime + LEAD_S;
   let i = ayahIndexAt(t);
   if (dir === 0) i = Math.max(0, i);
-  else if (dir < 0) i = i <= 0 ? 0 : t - tl.ayahs[i].t0 > 2 ? i : i - 1;
-  else i = Math.min(tl.ayahs.length - 1, i + 1);
-  v.currentTime = Math.max(0, tl.ayahs[i].t0 - 0.05);
+  else if (dir < 0) i = i <= 0 ? 0 : t - entries[i].t0 > 2 ? i : i - 1;
+  else i = Math.min(entries.length - 1, i + 1);
+  v.currentTime = Math.max(0, entries[i].t0 - (tl ? 0.05 : 0));
   if (v.paused && dir === 0) v.play().catch(() => {});
 }
 
 /** Ask the service worker whether this page's video already has a timeline. */
 function helloTimeline() {
-  chrome.runtime
-    .sendMessage({ type: 'TL_HELLO', url: location.href })
+  runtimeMessage({ type: 'TL_HELLO', url: location.href })
     .then((r) => {
       if (r?.timeline) loadTimeline(r.timeline);
     })
@@ -855,6 +977,12 @@ function showLive(m) {
   liveMatch = m;
   const ayahChanged = !shown || shown.ref !== m.ref;
   renderAyah(m, m.next || null);
+  if (browserCPU) {
+    caf(liveRaf);
+    liveRaf = null;
+    paintCpuHighlight(m.highlight);
+    return;
+  }
   const now = performance.now();
   if (ayahChanged) {
     prevWord = m.word || 0;
@@ -870,10 +998,32 @@ function showLive(m) {
   }
   anchorWord = m.word || 0;
   anchorTime = now;
-  if (liveRaf == null) liveRaf = raf(liveTick);
+  if (liveRaf == null) {
+    shownWord = anchorWord;
+    paintWords(shownWord);
+    liveRaf = raf(liveTick);
+  }
+}
+
+function paintCpuHighlight(highlight) {
+  clearTimeout(highlightTimer);
+  highlightTimer = null;
+  const remaining = (highlight?.expiresAt || 0) - Date.now();
+  if (!cpuHighlight || !highlight || highlight.ref !== liveMatch?.ref || highlight.word < 0 || remaining <= 0) {
+    paintWords(Infinity);
+    return;
+  }
+  // No rate extrapolation: show only the last acoustically supported word.
+  // Expiry includes inference/transport latency and clears silence/stale work.
+  const indices = displayWordIndices(liveMatch.arabic, builtText, highlight.word);
+  shownWord = indices[0] ?? -1;
+  if (!indices.length) return paintWords(Infinity);
+  paintWords(indices);
+  highlightTimer = setTimeout(() => paintWords(Infinity), Math.min(remaining, 1000));
 }
 
 function liveTick() {
+  if (!extensionAvailable()) return;
   if (!els || !liveMatch || wordEls.length === 0) {
     liveRaf = null;
     return;
@@ -890,23 +1040,130 @@ function liveTick() {
   paintWords(shownWord);
 }
 
+function renderCpuTimeline() {
+  if (!els || !cpuBuffer || !Number.isFinite(cpuBuffer.duration) || cpuBuffer.duration <= 0) return;
+  const pct = (t) => `${Math.max(0, Math.min(100, t / cpuBuffer.duration * 100)).toFixed(3)}%`;
+  els.ribbon.dataset.mode = 'cpu';
+  els.ribbon.title = 'CPU processed sections · click to seek';
+  els.ribbon.classList.toggle('hidden', videoKey(location.href) !== cpuBuffer.key);
+  els.fill.style.width = '0%'; // Never paint unprocessed gaps as recognized.
+  const signature = `${cpuBuffer.key}:${cpuBuffer.duration}:${(cpuBuffer.ranges || []).map((r) => r.id).join(',')}:${(cpuBuffer.marks || []).join(',')}`;
+  if (els.cpuTimelineSignature === signature) {
+    const spans = els.spans.querySelectorAll('.span');
+    for (let i = 0; i < spans.length; i++) {
+      const range = cpuBuffer.ranges[i];
+      spans[i].style.left = pct(range.from);
+      spans[i].style.width = pct(Math.min(cpuBuffer.duration, range.until) - range.from);
+      spans[i].title = `Processed ${clock(range.from)}–${clock(range.until)}`;
+    }
+    return;
+  }
+  els.cpuTimelineSignature = signature;
+  const fragment = document.createDocumentFragment();
+  for (const range of cpuBuffer.ranges || []) {
+    const span = document.createElement('div');
+    span.className = 'span';
+    span.style.left = pct(range.from);
+    span.style.width = pct(Math.min(cpuBuffer.duration, range.until) - range.from);
+    span.title = `Processed ${clock(range.from)}–${clock(range.until)}`;
+    fragment.append(span);
+  }
+  for (const time of cpuBuffer.marks || []) {
+    const tick = document.createElement('div');
+    tick.className = 'tick';
+    tick.style.left = pct(time);
+    fragment.append(tick);
+  }
+  els.spans.replaceChildren(fragment);
+}
+
+function bufferTick() {
+  if (!extensionAvailable()) return;
+  if (!cpuBuffer || !els) { bufferRaf = null; return; }
+  bufferRaf = raf(bufferTick);
+  const v = findVideo();
+  if (!v) return;
+  if (!Number.isFinite(cpuBuffer.duration) || cpuBuffer.duration <= 0) return;
+  const t = v.currentTime;
+  els.ribbon.classList.toggle('hidden', videoKey(location.href) !== cpuBuffer.key);
+  els.head.style.left = `${Math.max(0, Math.min(100, t / cpuBuffer.duration * 100))}%`;
+  const valid = videoKey(location.href) === cpuBuffer.key &&
+    Math.abs(v.duration - cpuBuffer.duration) <= 5 && !v.seeking;
+  const cue = valid && cpuBuffer.ready === true && t >= (cpuBuffer.cueFrom ?? cpuBuffer.from) && t <= (cpuBuffer.cueUntil ?? cpuBuffer.until) + 0.5
+    ? cpuBuffer.cues[ayahIndexAt(t, cpuBuffer.cues)] : null;
+  setPlayIcon(!v.paused);
+  if (!cue) {
+    const text = videoKey(location.href) === cpuBuffer.key
+      ? cpuBuffer.ready !== true
+        ? `CPU sync · preparing first ${Math.ceil(cpuBuffer.requiredSeconds || 12)}s · ${Math.floor(cpuBuffer.preparedSeconds || 0)}s recognized…`
+        : 'CPU look-ahead · preparing this position…'
+      : 'Video changed — start CPU sync again.';
+    if (shown || els.status.textContent !== text) setStatus(text, 'wait');
+    if (!valid && videoKey(location.href) !== cpuBuffer.key && browserCPU) {
+      els.restartCpu.classList.remove('hidden');
+    }
+    return;
+  }
+  const changed = shown?.ref !== cue.match.ref;
+  liveMatch = cue.match;
+  renderAyah(cue.match, cue.match.next);
+  const timing = displayTiming(cue);
+  const span = cpuHighlight ? timing.findLast((w) => w.start <= t && t < w.end) : null;
+  const word = span?.word ?? -1;
+  if (changed || word !== bufferedWord) {
+    bufferedWord = word;
+    const display = displayWordIndices(cue.match.arabic, builtText, word);
+    paintWords(display.length ? display : Infinity);
+  }
+  if (bufferedRef !== cue.match.ref) {
+    bufferedRef = cue.match.ref;
+    runtimeMessage({ type: 'BUFFER_POSITION', match: cue.match,
+      captureEpoch: cpuBuffer.captureEpoch }).catch(() => {});
+  }
+}
+
 // Reports this page's play/pause so the live estimate freezes with the video.
 let mediaArmed = false;
 let reportedPlaying = null;
 function reportMedia() {
+  if (!extensionAvailable()) return;
   let playing = false;
   for (const m of document.querySelectorAll('video, audio')) {
     if (!m.paused && !m.ended && m.readyState >= 2) playing = true;
   }
   if (playing !== reportedPlaying) {
     reportedPlaying = playing;
-    chrome.runtime.sendMessage({ type: 'MEDIA_STATE', playing }).catch(() => {});
+    runtimeMessage({ type: 'MEDIA_STATE', playing }).catch(() => {});
   }
 }
 function armMediaWatch() {
   if (mediaArmed) return reportMedia();
   mediaArmed = true;
-  setInterval(reportMedia, 500);
+  document.addEventListener('seeking', (event) => {
+    if (!extensionAvailable()) return;
+    if (!event.target?.matches?.('video, audio') || tl) return;
+    const following = !!liveMatch;
+    if (cpuBuffer && videoKey(location.href) === cpuBuffer.key) {
+      const time = event.target.currentTime;
+      const requiredSeconds = Math.min(CPU_LOOKAHEAD_SECONDS, Math.max(0, cpuBuffer.duration - time));
+      const cached = [...cpuSegments.values()].find((s) => s.ready && time >= (s.cueFrom ?? s.from) && time <= (s.cueUntil ?? s.until) &&
+        s.until >= time + requiredSeconds - 0.001);
+      cpuBuffer = cached ? { ...cached, ranges: cpuBuffer.ranges, marks: cpuBuffer.marks }
+        : { ...cpuBuffer, from: null, until: null, cues: [], ready: false, preparedSeconds: 0, requiredSeconds };
+    }
+    bufferedRef = null;
+    caf(bufferRaf);
+    bufferRaf = null;
+    liveMatch = null;
+    clearTimeout(highlightTimer);
+    shownWord = -1;
+    shown = null;
+    paintWords(-1);
+    if (following && !cpuBuffer?.ready) setStatus('Identifying the new passage…', 'wait');
+    if (cpuBuffer) bufferRaf = raf(bufferTick);
+    runtimeMessage({ type: 'CAPTURE_RESET', time: event.target.currentTime }).catch(() => {});
+  }, { capture: true, signal: contentLifecycle.signal });
+  mediaTimer = setInterval(reportMedia, 500);
   reportMedia();
 }
 
@@ -915,12 +1172,28 @@ const LIVE_STATUS = {
   listening: 'Listening for recitation…',
   stopped: 'Stopped.',
 };
+const liveStatus = (status) => browserCPU && cpuBufferedMode
+  ? status === 'loading-model' ? 'CPU sync · preparing audio…' : status === 'listening' ? 'CPU sync · preparing upcoming ayahs…' : LIVE_STATUS[status] || ''
+  : browserCPU && status === 'listening' ? 'Listening live · identifying recitation…'
+  : status === 'loading-model' && browserCPU ? 'Listening live · loading CPU model…' : LIVE_STATUS[status] || '';
 
 // ================================================================== messages
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+function onRuntimeMessage(msg, _sender, sendResponse) {
+  if (!extensionAvailable()) return;
+  if (msg?.type === 'CONTENT_PING') {
+    sendResponse({ ok: true });
+    return;
+  }
+  if (msg?.type === 'CAPTURE_CLOCK') {
+    const v = findVideo();
+    sendResponse(v ? { key: videoKey(location.href), href: location.href, src: v.currentSrc || v.src || '', time: v.currentTime, duration: v.duration,
+      playbackRate: v.playbackRate, seeking: v.seeking, paused: v.paused } : null);
+    return;
+  }
   if (msg?.type === 'TL_MEDIA') {
     const v = findVideo();
-    sendResponse({ src: v ? v.currentSrc || v.src || '' : '', duration: v ? v.duration : 0 });
+    sendResponse({ src: v ? v.currentSrc || v.src || '' : '', duration: v ? v.duration : 0,
+      time: v ? v.currentTime : 0, encrypted: !!v?.mediaKeys, href: location.href });
     return;
   }
   switch (msg?.type) {
@@ -939,17 +1212,54 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     case 'CARD_SHOW':
       if (tl) break;
+      cpuBufferedMode = msg.mode === 'lookahead';
       ensureCard();
-      setStatus(LIVE_STATUS[msg.status] || 'Starting…', 'wait');
+      setStatus(liveStatus(msg.status) || 'Starting…', 'wait');
       break;
     case 'CARD_STATUS':
       if (tl) break;
       ensureCard();
-      if (msg.status === 'error') setStatus(msg.error || 'Something went wrong.', 'err');
-      else if (!shown) setStatus(LIVE_STATUS[msg.status] || '', 'wait');
+      if (msg.status === 'error') {
+        cpuBuffer = null;
+        caf(bufferRaf);
+        bufferRaf = null;
+        setStatus(msg.error || 'Something went wrong.', 'err');
+      }
+      else if (!shown) setStatus(msg.detail || liveStatus(msg.status), 'wait');
+      break;
+    case 'CARD_DEBUG':
+      if (!DEV_MODE) break;
+      if (tl) break;
+      ensureCard();
+      els.debug.textContent = msg.text || '';
+      els.debug.classList.toggle('hidden', !msg.text);
+      if (browserCPU && !cpuBufferedMode && !shown && msg.text) {
+        setStatus(/^Listening live/i.test(msg.text) ? msg.text : `Listening live · ${msg.text}`, 'wait');
+      }
       break;
     case 'CARD_UPDATE':
-      if (!tl && msg.match) showLive(msg.match);
+      if (!tl && !cpuBuffer && msg.match) showLive(msg.match);
+      break;
+    case 'CARD_HIGHLIGHT':
+      if (!tl && browserCPU && liveMatch) {
+        liveMatch = { ...liveMatch, highlight: msg.highlight };
+        paintCpuHighlight(msg.highlight);
+      }
+      break;
+    case 'CARD_BUFFER':
+      if (tl || !msg.buffer) break;
+      ensureCard();
+      clearTimeout(highlightTimer);
+      caf(liveRaf);
+      liveRaf = null;
+      if (cpuBuffer?.key !== msg.buffer.key) cpuSegments.clear();
+      cpuBuffer = msg.buffer;
+      if (cpuBuffer.segmentId != null) cpuSegments.set(cpuBuffer.segmentId, cpuBuffer);
+      const retained = new Set((cpuBuffer.ranges || []).map((r) => r.id));
+      for (const id of cpuSegments.keys()) if (!retained.has(id)) cpuSegments.delete(id);
+      renderCpuTimeline();
+      bufferedWord = -2;
+      if (bufferRaf == null) bufferRaf = raf(bufferTick);
       break;
     case 'CARD_HIDE':
       if (!tl) hideCard();
@@ -974,7 +1284,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       armMediaWatch();
       break;
   }
-});
+}
+chrome.runtime.onMessage.addListener(onRuntimeMessage);
+
+// Hand off cleanly if a rebuilt content bundle is injected into the same page.
+document.dispatchEvent(new Event('qlt-content-replace'));
+document.addEventListener('qlt-content-replace', disposeContent, { signal: contentLifecycle.signal });
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) extensionAvailable();
+}, { signal: contentLifecycle.signal });
 
 // A reloaded page (or a tab opened before the extension) picks its sync back up.
 helloTimeline();
